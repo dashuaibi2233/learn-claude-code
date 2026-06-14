@@ -40,7 +40,8 @@ try:
 except ImportError:
     pass
 
-from anthropic import Anthropic
+import json
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
@@ -48,22 +49,37 @@ load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
+client = OpenAI(base_url=os.getenv("DASHSCOPE_BASE_URL"), api_key=os.getenv("DASHSCOPE_API_KEY"))
+MODEL = os.getenv("MODEL_ID", "qwen-plus")
 
 SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
 
 # ── Tool definition: just bash ────────────────────────────
+# TOOLS = [{
+#     "name": "bash",
+#     "description": "Run a shell command.",
+#     "input_schema": {
+#         "type": "object",
+#         "properties": {"command": {"type": "string"}},
+#         "required": ["command"],
+#     },
+# }]
+
+
 TOOLS = [{
-    "name": "bash",
-    "description": "Run a shell command.",
-    "input_schema": {
-        "type": "object",
-        "properties": {"command": {"type": "string"}},
-        "required": ["command"],
+    "type": "function",
+    "function": {
+        "name": "bash",
+        "description": "Run a shell command.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"}
+            },
+            "required": ["command"],
+        },
     },
 }]
-
 
 # ── Tool execution ────────────────────────────────────────
 def run_bash(command: str) -> str:
@@ -84,33 +100,40 @@ def run_bash(command: str) -> str:
 # ── The core pattern: a while loop that calls tools until the model stops ──
 def agent_loop(messages: list):
     while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "system", "content": SYSTEM}] + messages,
+            tools=TOOLS,
+            max_tokens=8000,
         )
 
-        # Append assistant turn
-        messages.append({"role": "assistant", "content": response.content})
+        msg = response.choices[0].message
 
-        # If the model didn't call a tool, we're done
-        if response.stop_reason != "tool_use":
+        # OpenAI 格式：assistant 消息要先塞回 history
+        messages.append(msg.model_dump(exclude_none=True))
+
+        # 没有 tool_calls，说明模型回答完了
+        if not msg.tool_calls:
             return
 
-        # Execute each tool call, collect results
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                print(f"\033[33m$ {block.input['command']}\033[0m")
-                output = run_bash(block.input["command"])
-                print(output[:200])
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": output,
-                })
+        # 执行工具
+        for tool_call in msg.tool_calls:
+            if tool_call.function.name != "bash":
+                continue
 
-        # Feed tool results back, loop continues
-        messages.append({"role": "user", "content": results})
+            args = json.loads(tool_call.function.arguments or "{}")
+            command = args.get("command", "")
+
+            print(f"\033[33m$ {command}\033[0m")
+            output = run_bash(command)
+            print(output[:200])
+
+            # OpenAI 格式：工具结果 role 是 tool
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": output,
+            })
 
 
 # ── Entry point ──────────────────────────────────────────
@@ -130,9 +153,6 @@ if __name__ == "__main__":
         history.append({"role": "user", "content": query})
         agent_loop(history)
         # Print the model's final text response
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            for block in response_content:
-                if getattr(block, "type", None) == "text":
-                    print(block.text)
+        if history and history[-1]["role"] == "assistant":
+            print(history[-1].get("content") or "")
         print()
