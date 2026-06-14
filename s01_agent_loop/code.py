@@ -117,6 +117,7 @@ def agent_loop(messages: list):
 if __name__ == "__main__":
     print("s01: Agent Loop")
     print("输入问题，回车发送。输入 q 退出。\n")
+    print(f"当前目录: {os.getcwd()}\n")
 
     history = []
     while True:
