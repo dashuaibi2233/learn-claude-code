@@ -1,8 +1,9 @@
-import os
-import subprocess
+from pathlib import Path
 
-command = "echo hello world"
-r = subprocess.run(command, shell=True, cwd=os.getcwd(),
-                           capture_output=True, text=True, timeout=120)
-print(r.stdout)
-print(r.stderr)
+basedir = Path.cwd()
+
+file_path = (basedir / "test.txt").resolve()
+
+print(file_path)
+
+print(file_path.is_relative_to(basedir))
