@@ -1,54 +1,26 @@
 #!/usr/bin/env python3
 """
-s04: Hooks — move extension logic out of the loop, onto hooks.
+s04: Hooks — Qwen/OpenAI-compatible version.
 
-  User types query
-       │
-       ▼
-  ┌──────────────────┐
-  │ UserPromptSubmit │ ── trigger_hooks() before LLM
-  └────────┬─────────┘
-           ▼
-  ┌────────────┐     ┌─────────────────────────────┐
-  │  messages  │────▶│  LLM (stop_reason=tool_use?)│
-  └────────────┘     │   No ──▶ Stop hooks ──▶ exit │
-                     │   Yes ──▶ tool_use block ──┐ │
-                     └────────────────────────────┘ │
-                                                    ▼
-                                          ┌──────────────────┐
-                                          │ trigger_hooks()   │
-                                          │  PreToolUse:      │
-                                          │   permission_hook │
-                                          │   log_hook        │
-                                          └───────┬──────────┘
-                                                  │ (not blocked)
-                                          ┌───────▼──────────┐
-                                          │ TOOL_HANDLERS[x]  │
-                                          └───────┬──────────┘
-                                                  │
-                                          ┌───────▼──────────┐
-                                          │ trigger_hooks()   │
-                                          │  PostToolUse:     │
-                                          │   large_output    │
-                                          └───────┬──────────┘
-                                                  │
-                                          results ──▶ back to messages
+Changes from Anthropic version:
+  - anthropic.Anthropic -> openai.OpenAI
+  - client.messages.create(...) -> client.chat.completions.create(...)
+  - Anthropic input_schema -> OpenAI tools[].function.parameters
+  - Anthropic tool_use/tool_result -> OpenAI tool_calls/tool messages
 
-Changes from s03:
-  + HOOKS registry (event -> list of callbacks)
-  + register_hook() / trigger_hooks()
-  + context_inject_hook (UserPromptSubmit)
-  + permission_hook, log_hook (PreToolUse)
-  + large_output_hook (PostToolUse)
-  + summary_hook (Stop)
-  - check_permission() removed from loop body
-    (logic moved into permission_hook, triggered via PreToolUse)
-
-Run: python s04_hooks/code.py
-Needs: pip install anthropic python-dotenv + ANTHROPIC_API_KEY in .env
+Run: python s04_hooks_qwen.py
+Needs: pip install openai python-dotenv
+.env example:
+  DASHSCOPE_API_KEY=sk-xxxx
+  MODEL_ID=qwen-plus
+  # optional:
+  # OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 """
 
-import os, subprocess
+import json
+import os
+import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 try:
@@ -60,22 +32,26 @@ try:
 except ImportError:
     pass
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
+from openai import OpenAI
 
 load_dotenv(override=True)
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
+
+# Qwen/DashScope provides an OpenAI-compatible API.
+# You can also override OPENAI_BASE_URL in .env.
+client = OpenAI(
+    api_key=os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY"),
+    base_url=os.getenv("OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+)
+MODEL = os.getenv("MODEL_ID", "qwen-plus")
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain."
 
 
 # ═══════════════════════════════════════════════════════════
-#  FROM s02-s03 (unchanged): Tool Implementations
+#  Tool Implementations
 # ═══════════════════════════════════════════════════════════
 
 def safe_path(p: str) -> Path:
@@ -84,46 +60,58 @@ def safe_path(p: str) -> Path:
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
+
 def run_bash(command: str) -> str:
     try:
-        r = subprocess.run(command, shell=True, cwd=WORKDIR,
-                           capture_output=True, text=True, timeout=120)
+        r = subprocess.run(
+            command,
+            shell=True,
+            cwd=WORKDIR,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
         out = (r.stdout + r.stderr).strip()
         return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
 
+
 def run_read(path: str, limit: int | None = None) -> str:
     try:
-        lines = safe_path(path).read_text().splitlines()
+        lines = safe_path(path).read_text(encoding="utf-8").splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
         return "\n".join(lines)
     except Exception as e:
         return f"Error: {e}"
 
+
 def run_write(path: str, content: str) -> str:
     try:
         file_path = safe_path(path)
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content)
+        file_path.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
 
+
 def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
         file_path = safe_path(path)
-        text = file_path.read_text()
+        text = file_path.read_text(encoding="utf-8")
         if old_text not in text:
             return f"Error: text not found in {path}"
-        file_path.write_text(text.replace(old_text, new_text, 1))
+        file_path.write_text(text.replace(old_text, new_text, 1), encoding="utf-8")
         return f"Edited {path}"
     except Exception as e:
         return f"Error: {e}"
 
+
 def run_glob(pattern: str) -> str:
     import glob as g
+
     try:
         results = []
         for match in g.glob(pattern, root_dir=WORKDIR):
@@ -133,33 +121,100 @@ def run_glob(pattern: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+
+# OpenAI/Qwen tool format: type=function + function.parameters
 TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to a file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in a file once.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-    {"name": "glob", "description": "Find files matching a glob pattern.",
-     "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Run a shell command.",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read file contents.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write content to a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Replace exact text in a file once.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string"},
+                },
+                "required": ["path", "old_text", "new_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "glob",
+            "description": "Find files matching a glob pattern.",
+            "parameters": {
+                "type": "object",
+                "properties": {"pattern": {"type": "string"}},
+                "required": ["pattern"],
+            },
+        },
+    },
 ]
 
 TOOL_HANDLERS = {
-    "bash": run_bash, "read_file": run_read, "write_file": run_write,
-    "edit_file": run_edit, "glob": run_glob,
+    "bash": run_bash,
+    "read_file": run_read,
+    "write_file": run_write,
+    "edit_file": run_edit,
+    "glob": run_glob,
 }
 
 
 # ═══════════════════════════════════════════════════════════
-#  NEW in s04: Hook System (s03 permission logic now via hooks)
+#  Hook System
 # ═══════════════════════════════════════════════════════════
 
 HOOKS = {"UserPromptSubmit": [], "PreToolUse": [], "PostToolUse": [], "Stop": []}
 
+
 def register_hook(event: str, callback):
     HOOKS[event].append(callback)
+
 
 def trigger_hooks(event: str, *args):
     for callback in HOOKS[event]:
@@ -169,12 +224,21 @@ def trigger_hooks(event: str, *args):
     return None
 
 
-# s03 permission check logic, now wrapped as a hook
+@dataclass
+class ToolBlock:
+    """Small adapter so existing hooks can keep using block.name/block.input/block.id."""
+
+    id: str
+    name: str
+    input: dict
+
+
 DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if="]
 DESTRUCTIVE = ["rm ", "> /etc/", "chmod 777"]
 
-def permission_hook(block):
-    """PreToolUse: s03 check_permission() logic moved here."""
+
+def permission_hook(block: ToolBlock):
+    """PreToolUse: permission check logic."""
     if block.name == "bash":
         for pattern in DENY_LIST:
             if pattern in block.input.get("command", ""):
@@ -197,30 +261,33 @@ def permission_hook(block):
                 return "Permission denied by user"
     return None
 
-def log_hook(block):
+
+def log_hook(block: ToolBlock):
     """PreToolUse: log every tool call."""
     args_preview = str(list(block.input.values())[:2])[:60]
     print(f"\033[90m[HOOK] {block.name}({args_preview})\033[0m")
     return None
 
-def large_output_hook(block, output):
+
+def large_output_hook(block: ToolBlock, output):
     """PostToolUse: warn on large output."""
     if len(str(output)) > 100000:
         print(f"\033[33m[HOOK] ⚠ Large output from {block.name}: {len(str(output))} chars\033[0m")
     return None
+
 
 # UserPromptSubmit hook: log user input before it reaches the LLM
 def context_inject_hook(query: str):
     print(f"\033[90m[HOOK] UserPromptSubmit: working in {WORKDIR}\033[0m")
     return None
 
+
 # Stop hook: print summary when loop is about to exit
 def summary_hook(messages: list):
-    tool_count = sum(1 for m in messages
-                     for b in (m.get("content") if isinstance(m.get("content"), list) else [])
-                     if isinstance(b, dict) and b.get("type") == "tool_result")
+    tool_count = sum(1 for m in messages if m.get("role") == "tool")
     print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
     return None
+
 
 register_hook("UserPromptSubmit", context_inject_hook)
 register_hook("PreToolUse", permission_hook)
@@ -230,50 +297,75 @@ register_hook("Stop", summary_hook)
 
 
 # ═══════════════════════════════════════════════════════════
-#  agent_loop — same structure as s03, but no hard-coded check
-#  s03: if not check_permission(block): ...
-#  s04: if trigger_hooks("PreToolUse", block): ...
+#  agent_loop — Qwen/OpenAI-compatible tool loop
 # ═══════════════════════════════════════════════════════════
+
+def _parse_tool_arguments(raw_arguments: str) -> dict:
+    try:
+        return json.loads(raw_arguments or "{}")
+    except json.JSONDecodeError as e:
+        return {"__json_error__": f"Invalid tool arguments JSON: {e}", "raw": raw_arguments}
+
 
 def agent_loop(messages: list):
     while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "system", "content": SYSTEM}] + messages,
+            tools=TOOLS,
+            tool_choice="auto",
+            max_tokens=8000,
         )
-        messages.append({"role": "assistant", "content": response.content})
 
-        if response.stop_reason != "tool_use":
+        message = response.choices[0].message
+        tool_calls = message.tool_calls or []
+
+        # No tool call: normal assistant answer, then stop hooks.
+        if not tool_calls:
+            content = message.content or ""
+            messages.append({"role": "assistant", "content": content})
+
             force = trigger_hooks("Stop", messages)
             if force:
                 messages.append({"role": "user", "content": force})
                 continue
-            return
+            return content
 
-        results = []
-        for block in response.content:
-            if block.type != "tool_use":
+        # Tool call: append assistant message with tool_calls exactly like OpenAI format.
+        messages.append(
+            {
+                "role": "assistant",
+                "content": message.content or "",
+                "tool_calls": [tc.model_dump(exclude_none=True) for tc in tool_calls],
+            }
+        )
+
+        for tc in tool_calls:
+            name = tc.function.name
+            args = _parse_tool_arguments(tc.function.arguments)
+            block = ToolBlock(id=tc.id, name=name, input=args)
+
+            if "__json_error__" in args:
+                output = args["__json_error__"]
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
                 continue
 
-            # s04 change: hook replaces hard-coded check_permission()
             blocked = trigger_hooks("PreToolUse", block)
             if blocked:
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": str(blocked)})
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(blocked)})
                 continue
 
-            handler = TOOL_HANDLERS.get(block.name)
-            output = handler(**block.input) if handler else f"Unknown: {block.name}"
+            handler = TOOL_HANDLERS.get(name)
+            output = handler(**args) if handler else f"Unknown tool: {name}"
 
-            trigger_hooks("PostToolUse", block, output)  # s04: post hook
+            trigger_hooks("PostToolUse", block, output)
 
-            results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
-
-        messages.append({"role": "user", "content": results})
+            # OpenAI/Qwen format: tool result is role=tool + tool_call_id.
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(output)})
 
 
 if __name__ == "__main__":
-    print("s04: Hooks — extension logic on hooks, loop stays clean")
+    print("s04: Hooks — Qwen/OpenAI-compatible tool loop")
     print("Type a question, press Enter. Type q to quit.\n")
 
     history = []
@@ -284,10 +376,10 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+
         trigger_hooks("UserPromptSubmit", query)
         history.append({"role": "user", "content": query})
-        agent_loop(history)
-        for block in history[-1]["content"]:
-            if getattr(block, "type", None) == "text":
-                print(block.text)
+        answer = agent_loop(history)
+        if answer:
+            print(answer)
         print()
