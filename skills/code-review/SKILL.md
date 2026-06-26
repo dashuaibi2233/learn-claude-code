@@ -1,68 +1,68 @@
 ---
 name: code-review
-description: Perform thorough code reviews with security, performance, and maintainability analysis. Use when user asks to review code, check for bugs, or audit a codebase.
+description: 执行深入代码审查，覆盖安全性、性能和可维护性分析。适用于用户要求 review 代码、检查 bug 或审计代码库时。
 ---
 
-# Code Review Skill
+# 代码审查技能
 
-You now have expertise in conducting comprehensive code reviews. Follow this structured approach:
+你现在具备执行全面代码审查的专业能力。请遵循下面的结构化方法：
 
-## Review Checklist
+## 审查清单
 
-### 1. Security (Critical)
+### 1. 安全性（关键）
 
-Check for:
-- [ ] **Injection vulnerabilities**: SQL, command, XSS, template injection
-- [ ] **Authentication issues**: Hardcoded credentials, weak auth
-- [ ] **Authorization flaws**: Missing access controls, IDOR
-- [ ] **Data exposure**: Sensitive data in logs, error messages
-- [ ] **Cryptography**: Weak algorithms, improper key management
-- [ ] **Dependencies**: Known vulnerabilities (check with `npm audit`, `pip-audit`)
+检查：
+- [ ] **注入漏洞**：SQL、命令、XSS、模板注入
+- [ ] **认证问题**：硬编码凭据、弱认证
+- [ ] **授权缺陷**：缺少访问控制、IDOR
+- [ ] **数据泄露**：日志或错误信息中包含敏感数据
+- [ ] **密码学问题**：弱算法、密钥管理不当
+- [ ] **依赖项**：已知漏洞（用 `npm audit`、`pip-audit` 检查）
 
 ```bash
-# Quick security scans
+# 快速安全扫描
 npm audit                    # Node.js
 pip-audit                    # Python
 cargo audit                  # Rust
 grep -r "password\|secret\|api_key" --include="*.py" --include="*.js"
 ```
 
-### 2. Correctness
+### 2. 正确性
 
-Check for:
-- [ ] **Logic errors**: Off-by-one, null handling, edge cases
-- [ ] **Race conditions**: Concurrent access without synchronization
-- [ ] **Resource leaks**: Unclosed files, connections, memory
-- [ ] **Error handling**: Swallowed exceptions, missing error paths
-- [ ] **Type safety**: Implicit conversions, any types
+检查：
+- [ ] **逻辑错误**：边界差一、null 处理、边界场景
+- [ ] **竞态条件**：并发访问缺少同步
+- [ ] **资源泄漏**：文件、连接、内存未关闭或未释放
+- [ ] **错误处理**：吞掉异常、缺少错误路径
+- [ ] **类型安全**：隐式转换、过度使用 any 类型
 
-### 3. Performance
+### 3. 性能
 
-Check for:
-- [ ] **N+1 queries**: Database calls in loops
-- [ ] **Memory issues**: Large allocations, retained references
-- [ ] **Blocking operations**: Sync I/O in async code
-- [ ] **Inefficient algorithms**: O(n^2) when O(n) possible
-- [ ] **Missing caching**: Repeated expensive computations
+检查：
+- [ ] **N+1 查询**：循环中访问数据库
+- [ ] **内存问题**：大对象分配、引用长期保留
+- [ ] **阻塞操作**：异步代码中使用同步 I/O
+- [ ] **低效算法**：本可 O(n) 却写成 O(n^2)
+- [ ] **缺少缓存**：重复执行昂贵计算
 
-### 4. Maintainability
+### 4. 可维护性
 
-Check for:
-- [ ] **Naming**: Clear, consistent, descriptive
-- [ ] **Complexity**: Functions > 50 lines, deep nesting > 3 levels
-- [ ] **Duplication**: Copy-pasted code blocks
-- [ ] **Dead code**: Unused imports, unreachable branches
-- [ ] **Comments**: Outdated, redundant, or missing where needed
+检查：
+- [ ] **命名**：清晰、一致、有描述性
+- [ ] **复杂度**：函数超过 50 行、嵌套超过 3 层
+- [ ] **重复**：复制粘贴的代码块
+- [ ] **死代码**：未使用 import、不可达分支
+- [ ] **注释**：过时、冗余，或必要处缺失
 
-### 5. Testing
+### 5. 测试
 
-Check for:
-- [ ] **Coverage**: Critical paths tested
-- [ ] **Edge cases**: Null, empty, boundary values
-- [ ] **Mocking**: External dependencies isolated
-- [ ] **Assertions**: Meaningful, specific checks
+检查：
+- [ ] **覆盖率**：关键路径有测试
+- [ ] **边界场景**：null、空值、边界值
+- [ ] **Mock**：外部依赖被隔离
+- [ ] **断言**：检查有意义且具体
 
-## Review Output Format
+## 审查输出格式
 
 ```markdown
 ## Code Review: [file/component name]
@@ -87,22 +87,22 @@ Check for:
 [ ] Needs major revision
 ```
 
-## Common Patterns to Flag
+## 常见需要标记的问题模式
 
 ### Python
 ```python
-# Bad: SQL injection
+# Bad: SQL 注入
 cursor.execute(f"SELECT * FROM users WHERE id = {user_id}")
 # Good:
 cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
 
-# Bad: Command injection
+# Bad: 命令注入
 os.system(f"ls {user_input}")
 # Good:
 subprocess.run(["ls", user_input], check=True)
 
-# Bad: Mutable default argument
-def append(item, lst=[]):  # Bug: shared mutable default
+# Bad: 可变默认参数
+def append(item, lst=[]):  # Bug: 共享同一个可变默认值
 # Good:
 def append(item, lst=None):
     lst = lst or []
@@ -110,16 +110,16 @@ def append(item, lst=None):
 
 ### JavaScript/TypeScript
 ```javascript
-// Bad: Prototype pollution
+// Bad: 原型污染
 Object.assign(target, userInput)
 // Good:
 Object.assign(target, sanitize(userInput))
 
-// Bad: eval usage
+// Bad: 使用 eval
 eval(userCode)
-// Good: Never use eval with user input
+// Good: 永远不要对用户输入使用 eval
 
-// Bad: Callback hell
+// Bad: 回调地狱
 getData(x => process(x, y => save(y, z => done(z))))
 // Good:
 const data = await getData();
@@ -127,31 +127,31 @@ const processed = await process(data);
 await save(processed);
 ```
 
-## Review Commands
+## 审查命令
 
 ```bash
-# Show recent changes
+# 查看最近变更
 git diff HEAD~5 --stat
 git log --oneline -10
 
-# Find potential issues
+# 查找潜在问题
 grep -rn "TODO\|FIXME\|HACK\|XXX" .
 grep -rn "password\|secret\|token" . --include="*.py"
 
-# Check complexity (Python)
+# 检查复杂度（Python）
 pip install radon && radon cc . -a
 
-# Check dependencies
+# 检查依赖
 npm outdated  # Node
 pip list --outdated  # Python
 ```
 
-## Review Workflow
+## 审查流程
 
-1. **Understand context**: Read PR description, linked issues
-2. **Run the code**: Build, test, run locally if possible
-3. **Read top-down**: Start with main entry points
-4. **Check tests**: Are changes tested? Do tests pass?
-5. **Security scan**: Run automated tools
-6. **Manual review**: Use checklist above
-7. **Write feedback**: Be specific, suggest fixes, be kind
+1. **理解上下文**：阅读 PR 描述、关联 issue
+2. **运行代码**：尽可能本地构建、测试、运行
+3. **自顶向下阅读**：从主入口开始
+4. **检查测试**：变更是否有测试？测试是否通过？
+5. **安全扫描**：运行自动化工具
+6. **人工审查**：使用上面的清单
+7. **编写反馈**：具体、给出修复建议、语气友善
