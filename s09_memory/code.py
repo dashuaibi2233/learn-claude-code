@@ -21,10 +21,12 @@ Flow in agent_loop:
 Builds on s08 (context compact). Usage:
 
     python s09_memory/code.py
-    Needs: pip install anthropic python-dotenv + ANTHROPIC_API_KEY in .env
+    Needs: pip install openai python-dotenv + DASHSCOPE_API_KEY in .env
+    Optional: MODEL_ID=qwen-plus, OPENAI_BASE_URL or DASHSCOPE_BASE_URL
 """
 
 import os, subprocess, json, time, re
+from dataclasses import dataclass
 from pathlib import Path
 
 try:
@@ -33,11 +35,10 @@ try:
 except ImportError:
     pass
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
+from openai import OpenAI
 
 load_dotenv(override=True)
-if os.getenv("ANTHROPIC_BASE_URL"): os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
 MEMORY_DIR = WORKDIR / ".memory"; MEMORY_DIR.mkdir(exist_ok=True)
@@ -45,8 +46,146 @@ MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 SKILLS_DIR = WORKDIR / "skills"
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
+client = OpenAI(
+    api_key=os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY"),
+    base_url=(
+        os.getenv("OPENAI_BASE_URL")
+        or os.getenv("DASHSCOPE_BASE_URL")
+        or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    ),
+)
+MODEL = os.getenv("MODEL_ID", "qwen-plus")
+
+
+@dataclass
+class ContentBlock:
+    type: str
+    text: str | None = None
+    id: str | None = None
+    name: str | None = None
+    input: dict | None = None
+
+
+@dataclass
+class AgentResponse:
+    content: list[ContentBlock]
+    stop_reason: str
+
+
+def to_openai_tools(tools: list[dict]) -> list[dict]:
+    """Convert the Anthropic-style teaching schema to OpenAI/Qwen tools."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": tool["name"],
+                "description": tool.get("description", ""),
+                "parameters": tool["input_schema"],
+            },
+        }
+        for tool in tools
+    ]
+
+
+def block_type(block):
+    return block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
+
+
+def block_text(block) -> str:
+    return str(block.get("text", "") if isinstance(block, dict) else (getattr(block, "text", "") or ""))
+
+
+def block_value(block, key: str, default=None):
+    return block.get(key, default) if isinstance(block, dict) else getattr(block, key, default)
+
+
+def extract_text(content) -> str:
+    if not isinstance(content, list):
+        return str(content)
+    return "\n".join(block_text(b) for b in content if block_type(b) == "text")
+
+
+def messages_to_openai(system: str, messages: list[dict]) -> list[dict]:
+    converted = [{"role": "system", "content": system}]
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content")
+
+        if isinstance(content, str):
+            converted.append({"role": role, "content": content})
+            continue
+
+        if role == "assistant" and isinstance(content, list):
+            text = extract_text(content).strip()
+            tool_calls = []
+            for block in content:
+                if block_type(block) != "tool_use":
+                    continue
+                tool_calls.append({
+                    "id": block_value(block, "id"),
+                    "type": "function",
+                    "function": {
+                        "name": block_value(block, "name"),
+                        "arguments": json.dumps(block_value(block, "input", {}) or {}, ensure_ascii=False),
+                    },
+                })
+            assistant_msg = {"role": "assistant", "content": text or None}
+            if tool_calls:
+                assistant_msg["tool_calls"] = tool_calls
+            converted.append(assistant_msg)
+            continue
+
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    converted.append({
+                        "role": "tool",
+                        "tool_call_id": block["tool_use_id"],
+                        "content": str(block.get("content", "")),
+                    })
+            continue
+
+        converted.append({"role": role, "content": str(content)})
+    return converted
+
+
+def call_model(system: str, messages: list[dict], tools: list[dict] | None = None,
+               max_tokens: int = 8000) -> AgentResponse:
+    kwargs = {
+        "model": MODEL,
+        "messages": messages_to_openai(system, messages),
+        "max_tokens": max_tokens,
+    }
+    if tools:
+        kwargs["tools"] = to_openai_tools(tools)
+        kwargs["tool_choice"] = "auto"
+    completion = client.chat.completions.create(**kwargs)
+    choice = completion.choices[0]
+    message = choice.message
+    content: list[ContentBlock] = []
+
+    if message.content:
+        content.append(ContentBlock(type="text", text=message.content))
+
+    for tool_call in message.tool_calls or []:
+        try:
+            tool_input = json.loads(tool_call.function.arguments or "{}")
+        except json.JSONDecodeError as e:
+            tool_input = {"__json_error__": f"Invalid tool arguments JSON: {e}"}
+        content.append(ContentBlock(
+            type="tool_use",
+            id=tool_call.id,
+            name=tool_call.function.name,
+            input=tool_input,
+        ))
+
+    stop_reason = "tool_use" if choice.finish_reason == "tool_calls" else choice.finish_reason
+    return AgentResponse(content=content, stop_reason=stop_reason)
+
+
+def call_text_model(prompt: str, max_tokens: int = 2000) -> str:
+    response = call_model("", [{"role": "user", "content": prompt}], max_tokens=max_tokens)
+    return extract_text(response.content).strip()
 
 
 # ═══════════════════════════════════════════════════════════
@@ -143,10 +282,7 @@ def select_relevant_memories(messages: list, max_items: int = 5) -> list[str]:
         if msg.get("role") == "user":
             content = msg.get("content", "")
             if isinstance(content, list):
-                content = " ".join(
-                    str(getattr(b, "text", "")) for b in content
-                    if getattr(b, "type", None) == "text"
-                )
+                content = extract_text(content)
             if isinstance(content, str):
                 recent_texts.append(content)
             if len(recent_texts) >= 3:
@@ -172,12 +308,7 @@ def select_relevant_memories(messages: list, max_items: int = 5) -> list[str]:
     )
 
     try:
-        response = client.messages.create(
-            model=MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=200,
-        )
-        text = extract_text(response.content).strip()
+        text = call_text_model(prompt, max_tokens=200)
         # Extract JSON array from response
         match = re.search(r'\[.*?\]', text, re.DOTALL)
         if match:
@@ -227,10 +358,7 @@ def extract_memories(messages: list):
         role = msg.get("role", "?")
         content = msg.get("content", "")
         if isinstance(content, list):
-            content = " ".join(
-                str(getattr(b, "text", "")) for b in content
-                if getattr(b, "type", None) == "text"
-            )
+            content = extract_text(content)
         if isinstance(content, str) and content.strip():
             dialogue_parts.append(f"{role}: {content}")
     dialogue = "\n".join(dialogue_parts)
@@ -256,10 +384,7 @@ def extract_memories(messages: list):
     )
 
     try:
-        response = client.messages.create(
-            model=MODEL, messages=[{"role": "user", "content": prompt}], max_tokens=800
-        )
-        text = extract_text(response.content).strip()
+        text = call_text_model(prompt, max_tokens=800)
         # Extract JSON array from response
         match = re.search(r'\[.*\]', text, re.DOTALL)
         if not match:
@@ -306,10 +431,7 @@ def consolidate_memories():
     )
 
     try:
-        response = client.messages.create(
-            model=MODEL, messages=[{"role": "user", "content": prompt}], max_tokens=3000
-        )
-        text = extract_text(response.content).strip()
+        text = call_text_model(prompt, max_tokens=3000)
         match = re.search(r'\[.*\]', text, re.DOTALL)
         if not match:
             return
@@ -399,10 +521,6 @@ def run_glob(pattern: str) -> str:
         return "\n".join(results) if results else "(no matches)"
     except Exception as e: return f"Error: {e}"
 
-def extract_text(content) -> str:
-    if not isinstance(content, list): return str(content)
-    return "\n".join(getattr(b, "text", "") for b in content if getattr(b, "type", None) == "text")
-
 # Subagent (simplified from s06-s07)
 SUB_TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
@@ -418,15 +536,18 @@ def spawn_subagent(task: str) -> str:
     print(f"\n\033[35m[Subagent spawned]\033[0m")
     messages = [{"role": "user", "content": task}]
     for _ in range(30):
-        response = client.messages.create(model=MODEL, system=SUB_SYSTEM,
-            messages=messages, tools=SUB_TOOLS, max_tokens=8000)
+        response = call_model(SUB_SYSTEM, messages, SUB_TOOLS, max_tokens=8000)
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use": break
         results = []
         for block in response.content:
             if block.type == "tool_use":
+                if block.input and "__json_error__" in block.input:
+                    results.append({"type": "tool_result", "tool_use_id": block.id,
+                                    "content": block.input["__json_error__"]})
+                    continue
                 handler = SUB_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown: {block.name}"
+                output = handler(**(block.input or {})) if handler else f"Unknown: {block.name}"
                 print(f"  \033[90m[sub] {block.name}: {str(output)[:100]}\033[0m")
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
         messages.append({"role": "user", "content": results})
@@ -527,11 +648,11 @@ def write_transcript(msgs):
 
 def summarize_history(msgs):
     conv = json.dumps(msgs, default=str)[:80000]
-    r = client.messages.create(model=MODEL, messages=[{"role": "user", "content":
+    return call_text_model(
         "Summarize this coding-agent conversation so work can continue.\n"
-        "Preserve: 1. current goal, 2. key findings, 3. files changed, 4. remaining work, 5. user constraints.\n\n" + conv}],
-        max_tokens=2000)
-    return extract_text(r.content).strip()
+        "Preserve: 1. current goal, 2. key findings, 3. files changed, 4. remaining work, 5. user constraints.\n\n" + conv,
+        max_tokens=2000,
+    )
 
 def compact_history(msgs):
     write_transcript(msgs)
@@ -610,9 +731,7 @@ def agent_loop(messages: list):
                     **messages[memory_turn],
                     "content": memories_content + "\n\n" + messages[memory_turn]["content"],
                 }
-            response = client.messages.create(
-                model=MODEL, system=system, messages=request_messages, tools=TOOLS, max_tokens=8000
-            )
+            response = call_model(system, request_messages, TOOLS, max_tokens=8000)
             reactive_retries = 0
         except Exception as e:
             if ("prompt_too_long" in str(e).lower() or "too many tokens" in str(e).lower()) and reactive_retries < MAX_REACTIVE_RETRIES:
@@ -633,8 +752,12 @@ def agent_loop(messages: list):
         for block in response.content:
             if block.type != "tool_use": continue
             print(f"\033[36m> {block.name}\033[0m")
+            if block.input and "__json_error__" in block.input:
+                results.append({"type": "tool_result", "tool_use_id": block.id,
+                                "content": block.input["__json_error__"]})
+                continue
             handler = TOOL_HANDLERS.get(block.name)
-            output = handler(**block.input) if handler else f"Unknown: {block.name}"
+            output = handler(**(block.input or {})) if handler else f"Unknown: {block.name}"
             print(str(output)[:200])
             results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
         messages.append({"role": "user", "content": results})
